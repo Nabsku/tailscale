@@ -3521,14 +3521,22 @@ func newTestConnAndRegistry(t *testing.T) (*Conn, *usermetric.Registry) {
 
 type wireGuardSendPacketConn struct {
 	nettype.PacketConn
-	writeErr error
-	packets  [][]byte
-	addrs    []netip.AddrPort
+	writeErr    error
+	beforeWrite func(netip.AddrPort) error
+	attempts    []netip.AddrPort
+	packets     [][]byte
+	addrs       []netip.AddrPort
 }
 
 func (c *wireGuardSendPacketConn) LocalAddr() net.Addr { return new(net.UDPAddr) }
 
 func (c *wireGuardSendPacketConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
+	c.attempts = append(c.attempts, addr)
+	if c.beforeWrite != nil {
+		if err := c.beforeWrite(addr); err != nil {
+			return 0, &net.OpError{Op: "write", Net: "udp", Err: err}
+		}
+	}
 	if c.writeErr != nil {
 		return 0, &net.OpError{Op: "write", Net: "udp", Err: c.writeErr}
 	}

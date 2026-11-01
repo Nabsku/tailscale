@@ -4,21 +4,315 @@
 package magicsock
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"net"
 	"net/netip"
+	"reflect"
+	"slices"
+	"strings"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/batching"
+	"tailscale.com/net/neterror"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/stun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/util/ringlog"
 )
+
+// Exercise the GSO-disabled result at the socket boundary, including a retry
+// that sent a prefix before failing. The endpoint must use RetryErr, not the
+// fact that GSO was disabled, to decide whether to try another family.
+type wireGuardGSOSendPacketConn struct {
+	batching.Conn
+	pc *wireGuardSendPacketConn
+}
+
+func (c *wireGuardGSOSendPacketConn) LocalAddr() net.Addr { return c.pc.LocalAddr() }
+
+func (c *wireGuardGSOSendPacketConn) WriteBatchTo(buffs [][]byte, addr netip.AddrPort, gh packet.GeneveHeader, offset int) error {
+	var err error
+	for _, b := range buffs {
+		if _, err = c.pc.WriteToUDPAddrPort(b[offset:], addr); err != nil {
+			break
+		}
+	}
+	return neterror.ErrUDPGSODisabled{OnLaddr: "test", RetryErr: err}
+}
+
+func TestWireGuardOnlyNetworkUnreachableFallback(t *testing.T) {
+	if !hasUDPTransport {
+		t.Skip("requires UDP transport")
+	}
+	v4 := netip.MustParseAddrPort("192.0.2.1:51820")
+	v6 := netip.MustParseAddrPort("[2001:db8::1]:51820")
+	ula := netip.MustParseAddrPort("[fd00::1]:51820")
+	scoped := netip.MustParseAddrPort("[fe80::1%missing-test-interface]:51820")
+	for _, tt := range []struct {
+		name                                           string
+		primary, alternate                             netip.AddrPort
+		primaryErr, alternateErr                       error
+		prefix, gso, ordinary, relay, latency          bool
+		expire, remove, receive, receiveDuringFallback bool
+		wantFallback                                   bool
+	}{
+		{name: "ipv6-to-ipv4", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, wantFallback: true},
+		{name: "ipv4-to-vpn-ula-despite-hints", primary: v4, alternate: ula, primaryErr: syscall.ENETUNREACH, wantFallback: true},
+		{name: "unavailable-scope-to-ipv4", primary: scoped, alternate: v4, primaryErr: syscall.ENETUNREACH, wantFallback: true},
+		{name: "fallback-preserves-scope", primary: v4, alternate: scoped, primaryErr: syscall.ENETUNREACH, wantFallback: true},
+		{name: "primary-success", primary: v6, alternate: v4},
+		{name: "unrelated-error", primary: v6, alternate: v4, primaryErr: syscall.ETIMEDOUT},
+		{name: "no-alternate", primary: v6, primaryErr: syscall.ENETUNREACH},
+		{name: "both-fail", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, alternateErr: syscall.EACCES, wantFallback: true},
+		{name: "partial-prefix", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, prefix: true, wantFallback: true},
+		{name: "gso-retry-failed", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, gso: true, prefix: true, wantFallback: true},
+		{name: "gso-retry-succeeded", primary: v6, alternate: v4, gso: true},
+		{name: "expired-during-primary-send", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, expire: true},
+		{name: "alternate-removed-during-primary-send", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, remove: true},
+		{name: "prefer-newly-received-address", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, receive: true, wantFallback: true},
+		{name: "preserve-receive-during-failed-fallback", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, alternateErr: syscall.EHOSTUNREACH, receiveDuringFallback: true, wantFallback: true},
+		{name: "measured-primary-and-alternate", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, latency: true, wantFallback: true},
+		{name: "ordinary-peer-unchanged", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, ordinary: true},
+		{name: "peer-relay-unchanged", primary: v6, alternate: v4, primaryErr: syscall.ENETUNREACH, relay: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := &Conn{logf: t.Logf, metrics: new(metrics)}
+				c.noV4.Store(true)
+				c.noV6.Store(true)
+				ep := &endpoint{c: c, isWireguardOnly: !tt.ordinary, heartbeatDisabled: true, lastFullPing: mono.Now(),
+					lastSendAny: mono.Now(), bestAddrAt: mono.Now(), trustBestAddrUntil: mono.Now().Add(time.Second),
+					endpointState: map[netip.AddrPort]*endpointState{tt.primary: {}},
+				}
+				ep.bestAddr.ap = tt.primary
+				if tt.relay {
+					ep.bestAddr.vni.Set(1)
+				}
+				if tt.alternate.IsValid() {
+					ep.endpointState[tt.alternate] = &endpointState{}
+				}
+				received := netip.AddrPortFrom(tt.alternate.Addr(), 51821)
+				if tt.latency {
+					ep.trustBestAddrUntil = 0
+					ep.endpointState[tt.primary].recentPongs = []pongReply{{latency: time.Millisecond}}
+					ep.endpointState[tt.alternate].recentPongs = []pongReply{{latency: 2 * time.Millisecond}}
+					ep.endpointState[netip.AddrPortFrom(tt.alternate.Addr(), 51822)] = &endpointState{recentPongs: []pongReply{{latency: 3 * time.Millisecond}}}
+				}
+				primary, alternate := new(wireGuardSendPacketConn), new(wireGuardSendPacketConn)
+				primary.beforeWrite = func(netip.AddrPort) error {
+					if tt.prefix && len(primary.attempts) == 1 {
+						return nil
+					}
+					if tt.expire || tt.remove {
+						ep.mu.Lock()
+						ep.expired = tt.expire
+						if tt.remove {
+							delete(ep.endpointState, tt.alternate)
+						}
+						ep.mu.Unlock()
+					}
+					if tt.receive {
+						ep.noteRecvActivity(epAddr{ap: received}, mono.Now())
+					}
+					return tt.primaryErr
+				}
+				alternate.beforeWrite = func(netip.AddrPort) error {
+					if tt.receiveDuringFallback {
+						ep.noteRecvActivity(epAddr{ap: received}, mono.Now())
+					}
+					return tt.alternateErr
+				}
+				pc4, pc6 := alternate, primary
+				if tt.primary.Addr().Is4() {
+					pc4, pc6 = primary, alternate
+				}
+				c.pconn4.setConnLocked(pc4, "udp4", nil)
+				c.pconn6.setConnLocked(pc6, "udp6", nil)
+				if tt.gso {
+					pc := &c.pconn6
+					if tt.primary.Addr().Is4() {
+						pc = &c.pconn4
+					}
+					pc.setConnLocked(&wireGuardGSOSendPacketConn{pc: primary}, "udp", nil)
+				}
+				var counted []netip.AddrPort
+				c.connCounter.Store(func(_ ipproto.Proto, _, dst netip.AddrPort, packets, nbytes int, recv bool) {
+					if packets != 2 || nbytes != 3 || recv {
+						t.Errorf("counter: packets=%d bytes=%d recv=%v", packets, nbytes, recv)
+					}
+					counted = append(counted, dst)
+				})
+				payload := [][]byte{[]byte("a"), []byte("bc")}
+				buffs := [][]byte{append(make([]byte, packet.GeneveFixedHeaderLength), payload[0]...), append(make([]byte, packet.GeneveFixedHeaderLength), payload[1]...)}
+				before := metricSendData.Value()
+				err := c.Send(buffs, ep, packet.GeneveFixedHeaderLength)
+				wantErr := tt.primaryErr != nil && (!tt.wantFallback || tt.alternateErr != nil)
+				if (err != nil) != wantErr {
+					t.Fatalf("Send = %v, want error=%v", err, wantErr)
+				}
+				if wantErr && !errors.Is(err, tt.primaryErr) {
+					t.Errorf("lost primary error: %v", err)
+				}
+				if tt.wantFallback && tt.alternateErr != nil {
+					if !errors.Is(err, tt.alternateErr) || !strings.Contains(err.Error(), tt.primary.String()) || !strings.Contains(err.Error(), tt.alternate.String()) {
+						t.Errorf("missing errors/destinations: %v", err)
+					}
+				}
+				wantPrimaryAttempts := 1
+				if tt.primaryErr == nil || tt.prefix {
+					wantPrimaryAttempts = 2
+				}
+				if len(primary.attempts) != wantPrimaryAttempts {
+					t.Errorf("primary attempts=%v", primary.attempts)
+				}
+				var wantAlternateAttempts []netip.AddrPort
+				if tt.wantFallback {
+					dst := tt.alternate
+					if tt.receive {
+						dst = received
+					}
+					wantAlternateAttempts = []netip.AddrPort{dst}
+					if tt.alternateErr == nil {
+						wantAlternateAttempts = append(wantAlternateAttempts, dst)
+					}
+					if tt.alternateErr == nil && !reflect.DeepEqual(alternate.packets, payload) {
+						t.Errorf("fallback packets=%q, want %q", alternate.packets, payload)
+					}
+				}
+				if !slices.Equal(alternate.attempts, wantAlternateAttempts) {
+					t.Errorf("fallback attempts=%v, want %v", alternate.attempts, wantAlternateAttempts)
+				}
+				if got := metricSendData.Value() - before; got != 2 {
+					t.Errorf("logical packets=%d, want 2", got)
+				}
+				var wantDropped int64
+				if wantErr {
+					wantDropped = 2
+				}
+				if got := c.metrics.outboundPacketsDroppedErrors.Value(); got != wantDropped {
+					t.Errorf("dropped=%d, error=%v", got, wantErr)
+				}
+				if !tt.relay {
+					primaryPackets, alternatePackets := c.metrics.outboundPacketsIPv6Total.Value(), c.metrics.outboundPacketsIPv4Total.Value()
+					primaryBytes, alternateBytes := c.metrics.outboundBytesIPv6Total.Value(), c.metrics.outboundBytesIPv4Total.Value()
+					if tt.primary.Addr().Is4() {
+						primaryPackets, alternatePackets = alternatePackets, primaryPackets
+						primaryBytes, alternateBytes = alternateBytes, primaryBytes
+					}
+					wantAlternatePackets, wantAlternateBytes := int64(0), int64(0)
+					if tt.wantFallback {
+						wantAlternatePackets, wantAlternateBytes = 2, 3
+					}
+					if primaryPackets != 2 || primaryBytes != 3 || alternatePackets != wantAlternatePackets || alternateBytes != wantAlternateBytes {
+						t.Errorf("attempt counters: primary=%d/%d alternate=%d/%d", primaryPackets, primaryBytes, alternatePackets, alternateBytes)
+					}
+				}
+				var wantCounted []netip.AddrPort
+				if !wantErr {
+					dst := tt.primary
+					if tt.wantFallback {
+						dst = tt.alternate
+						if tt.receive {
+							dst = received
+						}
+					}
+					wantCounted = []netip.AddrPort{dst}
+				}
+				if !slices.Equal(counted, wantCounted) {
+					t.Errorf("successful connection counters=%v, want %v", counted, wantCounted)
+				}
+				if tt.receive || tt.receiveDuringFallback {
+					alternate.beforeWrite = nil
+					if err := c.Send(buffs, ep, packet.GeneveFixedHeaderLength); err != nil {
+						t.Fatal(err)
+					}
+					if got := alternate.addrs[len(alternate.addrs)-1]; got != received {
+						t.Errorf("receive-confirmed next send=%v, want %v", got, received)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestWireGuardOnlyIdleNetworkUnreachableFallback(t *testing.T) {
+	if !hasUDPTransport {
+		t.Skip("requires UDP transport")
+	}
+	for _, statusFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("status-before-send=%v", statusFirst), func(t *testing.T) {
+			// A local IPv4 snapshot must not become a permanent family filter.
+			func() {
+				netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) {
+					return []netmon.Interface{{Interface: &net.Interface{Name: "idle-test0", Flags: net.FlagUp}, AltAddrs: []net.Addr{&net.IPAddr{IP: net.IPv4(192, 0, 2, 2).To4()}}}}, nil
+				})
+				defer netmon.RegisterInterfaceGetter(nil)
+				synctest.Test(t, func(t *testing.T) {
+					v4 := netip.MustParseAddrPort("192.0.2.1:51820")
+					v6 := netip.MustParseAddrPort("[2001:db8::1]:51820")
+					c := &Conn{logf: t.Logf, metrics: new(metrics), netMon: netmon.NewStatic(), peerMap: newPeerMap()}
+					c.testOnlyPickWireGuardEndpoint = func(candidates []netip.AddrPort) netip.AddrPort {
+						for _, a := range candidates {
+							if a.Addr().Is6() {
+								return a
+							}
+						}
+						return candidates[0]
+					}
+					pc4, pc6 := new(wireGuardSendPacketConn), &wireGuardSendPacketConn{writeErr: syscall.ENETUNREACH}
+					c.pconn4.setConnLocked(pc4, "udp4", nil)
+					c.pconn6.setConnLocked(pc6, "udp6", nil)
+					ep := &endpoint{c: c, isWireguardOnly: true, heartbeatDisabled: true, lastFullPing: mono.Now(), endpointState: map[netip.AddrPort]*endpointState{}}
+					peer := (&tailcfg.Node{Key: key.NewNode().Public(), Endpoints: []netip.AddrPort{v4, v6}}).View()
+					ep.setEndpointsLocked(peer.Endpoints())
+					c.peerMap.byNodeKey[peer.Key()] = newPeerInfo(ep)
+					payload := []byte("encrypted packet")
+					buffs := [][]byte{append(make([]byte, packet.GeneveFixedHeaderLength), payload...)}
+					if err := c.Send(buffs, ep, packet.GeneveFixedHeaderLength); err != nil {
+						t.Fatal(err)
+					}
+					if !slices.Equal(pc4.addrs, []netip.AddrPort{v4}) || len(pc6.attempts) != 0 {
+						t.Fatal("cold send did not use only IPv4")
+					}
+					incoming := &lazyEndpoint{c: c, src: epAddr{ap: v4}}
+					incoming.InitiationMessagePublicKey(peer.Key().Raw32())
+					if err := c.Send(buffs, ep, packet.GeneveFixedHeaderLength); err != nil {
+						t.Fatal(err)
+					}
+					if len(pc4.addrs) != 2 || len(pc6.attempts) != 0 {
+						t.Fatal("receive-confirmed send did not use IPv4")
+					}
+					time.Sleep(5*time.Second + time.Nanosecond)
+					if statusFirst {
+						var status ipnstate.PeerStatus
+						ep.populatePeerStatus(&status)
+						if status.CurAddr != v6.String() {
+							t.Fatalf("prospective status=%q, want %v", status.CurAddr, v6)
+						}
+					}
+					if err := c.Send(buffs, ep, packet.GeneveFixedHeaderLength); err != nil {
+						t.Fatalf("idle reconnect: %v", err)
+					}
+					if !slices.Equal(pc6.attempts, []netip.AddrPort{v6}) || !slices.Equal(pc4.addrs, []netip.AddrPort{v4, v4, v4}) || !bytes.Equal(pc4.packets[2], payload) {
+						t.Fatalf("reconnect: IPv6 attempts=%v IPv4 destinations=%v packets=%q", pc6.attempts, pc4.addrs, pc4.packets)
+					}
+				})
+			}()
+		})
+	}
+}
 
 func TestProbeUDPLifetimeConfig_Equals(t *testing.T) {
 	tests := []struct {

@@ -1179,7 +1179,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	var err error
 	if hasUDPTransport && udpAddr.ap.IsValid() {
-		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		err = de.sendUDPBatch(udpAddr, buffs, offset)
 
 		// If the error is known to indicate that the endpoint is no longer
 		// usable, clear the endpoint statistics so that the next send will
@@ -1188,33 +1188,16 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 			de.noteBadEndpoint(udpAddr)
 		}
 
-		var txBytes int
-		for _, b := range buffs {
-			txBytes += len(b[offset:])
-		}
-
-		switch {
-		case udpAddr.ap.Addr().Is4():
-			if udpAddr.vni.IsSet() {
-				de.c.metrics.outboundPacketsPeerRelayIPv4Total.Add(int64(len(buffs)))
-				de.c.metrics.outboundBytesPeerRelayIPv4Total.Add(int64(txBytes))
-			} else {
-				de.c.metrics.outboundPacketsIPv4Total.Add(int64(len(buffs)))
-				de.c.metrics.outboundBytesIPv4Total.Add(int64(txBytes))
+		if de.isWireguardOnly && udpAddr.isDirect() && isNetworkUnreachableErr(err) {
+			if alternate := de.wireGuardFallbackAddr(udpAddr); alternate.ap.IsValid() {
+				// A failed batch may have sent a prefix. Repeating ciphertext is
+				// safe for WireGuard replay protection; try the other family once.
+				if alternateErr := de.sendUDPBatch(alternate, buffs, offset); alternateErr != nil {
+					err = errors.Join(fmt.Errorf("send to %v: %w", udpAddr.ap, err), fmt.Errorf("send to %v: %w", alternate.ap, alternateErr))
+				} else {
+					err = nil
+				}
 			}
-		case udpAddr.ap.Addr().Is6():
-			if udpAddr.vni.IsSet() {
-				de.c.metrics.outboundPacketsPeerRelayIPv6Total.Add(int64(len(buffs)))
-				de.c.metrics.outboundBytesPeerRelayIPv6Total.Add(int64(txBytes))
-			} else {
-				de.c.metrics.outboundPacketsIPv6Total.Add(int64(len(buffs)))
-				de.c.metrics.outboundBytesIPv6Total.Add(int64(txBytes))
-			}
-		}
-
-		// TODO(raggi): needs updating for accuracy, as in error conditions we may have partial sends.
-		if update := de.c.connCounter.Load(); err == nil && update != nil {
-			update(0, netip.AddrPortFrom(de.nodeAddr, 0), udpAddr.ap, len(buffs), txBytes, false)
 		}
 	}
 	if derpAddr.IsValid() {
@@ -1237,6 +1220,70 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		if allOk {
 			return nil
 		}
+	}
+	return err
+}
+
+// wireGuardFallbackAddr selects from current opposite-family paths without
+// treating interface/netcheck hints as a routing oracle or changing path trust.
+func (de *endpoint) wireGuardFallbackAddr(failed epAddr) epAddr {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	if de.expired {
+		return epAddr{}
+	}
+	if best := de.bestAddr.epAddr; best.isDirect() && best.ap.Addr().Is4() != failed.ap.Addr().Is4() && !mono.Now().After(de.trustBestAddrUntil) {
+		return best
+	}
+	var best epAddr
+	var lowestLatency time.Duration
+	var candidates []netip.AddrPort
+	for addr, state := range de.endpointState {
+		if addr.Addr().Is4() == failed.ap.Addr().Is4() {
+			continue
+		}
+		candidates = append(candidates, addr)
+		if latency, ok := state.latencyLocked(); ok && (!best.ap.IsValid() || latency < lowestLatency) {
+			best.ap, lowestLatency = addr, latency
+		}
+	}
+	if best.ap.IsValid() || len(candidates) == 0 {
+		return best
+	}
+	if pick := de.c.testOnlyPickWireGuardEndpoint; pick != nil {
+		return epAddr{ap: pick(candidates)}
+	}
+	return epAddr{ap: candidates[rand.IntN(len(candidates))]}
+}
+
+// sendUDPBatch accounts for each attempted path, not each logical Conn.Send.
+func (de *endpoint) sendUDPBatch(udpAddr epAddr, buffs [][]byte, offset int) error {
+	_, err := de.c.sendUDPBatch(udpAddr, buffs, offset)
+	var txBytes int
+	for _, b := range buffs {
+		txBytes += len(b[offset:])
+	}
+	switch {
+	case udpAddr.ap.Addr().Is4():
+		if udpAddr.vni.IsSet() {
+			de.c.metrics.outboundPacketsPeerRelayIPv4Total.Add(int64(len(buffs)))
+			de.c.metrics.outboundBytesPeerRelayIPv4Total.Add(int64(txBytes))
+		} else {
+			de.c.metrics.outboundPacketsIPv4Total.Add(int64(len(buffs)))
+			de.c.metrics.outboundBytesIPv4Total.Add(int64(txBytes))
+		}
+	case udpAddr.ap.Addr().Is6():
+		if udpAddr.vni.IsSet() {
+			de.c.metrics.outboundPacketsPeerRelayIPv6Total.Add(int64(len(buffs)))
+			de.c.metrics.outboundBytesPeerRelayIPv6Total.Add(int64(txBytes))
+		} else {
+			de.c.metrics.outboundPacketsIPv6Total.Add(int64(len(buffs)))
+			de.c.metrics.outboundBytesIPv6Total.Add(int64(txBytes))
+		}
+	}
+	// TODO(raggi): needs updating for accuracy, as in error conditions we may have partial sends.
+	if update := de.c.connCounter.Load(); err == nil && update != nil {
+		update(0, netip.AddrPortFrom(de.nodeAddr, 0), udpAddr.ap, len(buffs), txBytes, false)
 	}
 	return err
 }
