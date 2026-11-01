@@ -3519,6 +3519,163 @@ func newTestConnAndRegistry(t *testing.T) (*Conn, *usermetric.Registry) {
 	return conn, reg
 }
 
+type wireGuardSendPacketConn struct {
+	nettype.PacketConn
+	writeErr error
+	packets  [][]byte
+	addrs    []netip.AddrPort
+}
+
+func (c *wireGuardSendPacketConn) LocalAddr() net.Addr { return new(net.UDPAddr) }
+
+func (c *wireGuardSendPacketConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
+	if c.writeErr != nil {
+		return 0, &net.OpError{Op: "write", Net: "udp", Err: c.writeErr}
+	}
+	c.packets = append(c.packets, bytes.Clone(b))
+	c.addrs = append(c.addrs, addr)
+	return len(b), nil
+}
+
+func TestWireGuardOnlyFirstSendAddressFamily(t *testing.T) {
+	if !hasUDPTransport {
+		t.Skip("requires UDP transport")
+	}
+	v4 := netip.MustParseAddrPort("192.0.2.1:51820")
+	v6 := netip.MustParseAddrPort("[2001:db8::1]:51820")
+	for _, tt := range []struct {
+		name         string
+		endpoints    []netip.AddrPort
+		noV4, noV6   bool
+		pickV4       bool
+		unreachable  bool
+		sentBefore   bool
+		knownLatency bool
+		emptyFirst   bool
+		pingFirst    bool
+		recvFirst    bool
+		expireRecv   bool
+		want         netip.AddrPort
+	}{
+		{name: "ipv4-underlay", endpoints: []netip.AddrPort{v4, v6}, noV6: true, unreachable: true, want: v4},
+		{name: "ipv6-underlay", endpoints: []netip.AddrPort{v4, v6}, noV4: true, pickV4: true, unreachable: true, want: v6},
+		{name: "ipv6-only-peer-despite-hint", endpoints: []netip.AddrPort{v6}, noV6: true, want: v6},
+		{name: "ipv4-only-peer-despite-hint", endpoints: []netip.AddrPort{v4}, noV4: true, want: v4},
+		{name: "both-families-missing", endpoints: []netip.AddrPort{v4, v6}, noV4: true, noV6: true, want: v6},
+		{name: "unknown-families", endpoints: []netip.AddrPort{v4, v6}, want: v6},
+		{name: "later-send-despite-hint", endpoints: []netip.AddrPort{v4, v6}, noV6: true, sentBefore: true, want: v6},
+		{name: "measured-latency-despite-hint", endpoints: []netip.AddrPort{v4, v6}, noV6: true, knownLatency: true, want: v6},
+		{name: "no-endpoints"},
+		{name: "endpoints-arrive-after-failed-send", endpoints: []netip.AddrPort{v4, v6}, noV6: true, unreachable: true, emptyFirst: true, want: v4},
+		{name: "hints-arrive-after-ping", endpoints: []netip.AddrPort{v4, v6}, noV6: true, unreachable: true, pingFirst: true, want: v4},
+		{name: "reply-to-inbound-source-without-endpoints", noV4: true, recvFirst: true, want: v4},
+		{name: "reply-to-inbound-source-with-stale-endpoint", endpoints: []netip.AddrPort{v6}, noV4: true, recvFirst: true, want: v4},
+		{name: "hints-after-expired-receive-and-ping", endpoints: []netip.AddrPort{v4, v6}, noV6: true, unreachable: true, recvFirst: true, expireRecv: true, pingFirst: true, want: v4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := &Conn{logf: t.Logf, metrics: new(metrics)}
+				c.noV4.Store(tt.noV4)
+				c.noV6.Store(tt.noV6)
+				c.testOnlyPickWireGuardEndpoint = func(candidates []netip.AddrPort) netip.AddrPort {
+					for _, addr := range candidates {
+						if addr.Addr().Is4() == tt.pickV4 {
+							return addr
+						}
+					}
+					return candidates[0]
+				}
+				pc4, pc6 := new(wireGuardSendPacketConn), new(wireGuardSendPacketConn)
+				if tt.unreachable {
+					if tt.noV4 {
+						pc4.writeErr = syscall.ENETUNREACH
+					} else {
+						pc6.writeErr = syscall.ENETUNREACH
+					}
+				}
+				c.pconn4.mu.Lock()
+				c.pconn4.setConnLocked(pc4, "udp4", nil)
+				c.pconn4.mu.Unlock()
+				c.pconn6.mu.Lock()
+				c.pconn6.setConnLocked(pc6, "udp6", nil)
+				c.pconn6.mu.Unlock()
+				ep := &endpoint{
+					c:                 c,
+					isWireguardOnly:   true,
+					heartbeatDisabled: true,
+					// Keep this send test independent of background ICMP discovery.
+					lastFullPing:  mono.Now(),
+					endpointState: map[netip.AddrPort]*endpointState{},
+				}
+				if tt.emptyFirst {
+					if err := c.Send(nil, ep, packet.GeneveFixedHeaderLength); !errors.Is(err, errNoUDPOrDERP) {
+						t.Fatalf("Send before endpoints arrive = %v, want %v", err, errNoUDPOrDERP)
+					}
+				}
+				peer := (&tailcfg.Node{Key: key.NewNode().Public(), Name: "wireguard-only", Endpoints: tt.endpoints}).View()
+				ep.mu.Lock()
+				ep.setEndpointsLocked(peer.Endpoints())
+				ep.mu.Unlock()
+				if tt.sentBefore {
+					ep.lastSendAny = mono.Now()
+				}
+				if tt.knownLatency {
+					ep.endpointState[v6].recentPongs = []pongReply{{latency: time.Millisecond}}
+				}
+				want := [][]byte{[]byte("first packet"), []byte("second packet")}
+				buffs := make([][]byte, len(want))
+				for i, payload := range want {
+					buffs[i] = append(make([]byte, packet.GeneveFixedHeaderLength), payload...)
+				}
+				if tt.recvFirst {
+					c.peerMap = newPeerMap()
+					c.peerMap.byNodeKey[peer.Key()] = newPeerInfo(ep)
+					incoming := &lazyEndpoint{c: c, src: epAddr{ap: v4}}
+					incoming.InitiationMessagePublicKey(peer.Key().Raw32())
+				}
+				if tt.expireRecv {
+					// Expire noteRecvActivity's five-second trust in synthetic time.
+					time.Sleep(5*time.Second + time.Nanosecond)
+				}
+				if tt.pingFirst {
+					c.noV6.Store(false)
+					c.privateKey = key.NewNode()
+					c.peerMap = newPeerMap()
+					c.peerMap.byNodeKey[peer.Key()] = newPeerInfo(ep)
+					c.Ping(peer, new(ipnstate.PingResult), 0, func(*ipnstate.PingResult) {})
+					c.noV6.Store(tt.noV6)
+				}
+				err := c.Send(buffs, ep, packet.GeneveFixedHeaderLength)
+				if !tt.want.IsValid() {
+					if !errors.Is(err, errNoUDPOrDERP) {
+						t.Fatalf("Send with no endpoints = %v, want %v", err, errNoUDPOrDERP)
+					}
+					if len(pc4.packets)+len(pc6.packets) != 0 {
+						t.Fatal("sent packets with no endpoints")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("Send: %v", err)
+				}
+				got, other := pc4, pc6
+				if tt.want.Addr().Is6() {
+					got, other = pc6, pc4
+				}
+				if !reflect.DeepEqual(got.packets, want) {
+					t.Errorf("packets = %q, want %q", got.packets, want)
+				}
+				if wantAddrs := []netip.AddrPort{tt.want, tt.want}; !slices.Equal(got.addrs, wantAddrs) {
+					t.Errorf("destinations = %v, want %v", got.addrs, wantAddrs)
+				}
+				if len(other.packets) != 0 {
+					t.Errorf("unexpected packets on other family: %q", other.packets)
+				}
+			})
+		})
+	}
+}
+
 func TestNetworkSendErrors(t *testing.T) {
 	t.Run("network-down", func(t *testing.T) {
 		// TODO(alexc): This test case fails on Windows because it never

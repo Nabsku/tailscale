@@ -173,6 +173,9 @@ type Conn struct {
 	controlKnobs           *controlknobs.Knobs                                     // or nil
 	derpAppName            string                                                  // or empty, see Options.DERPAppName
 
+	// testOnlyPickWireGuardEndpoint overrides random selection in tests.
+	testOnlyPickWireGuardEndpoint func([]netip.AddrPort) netip.AddrPort
+
 	// ================================================================
 	// No locking required to access these fields, either because
 	// they're static after construction, or are wholly owned by a
@@ -221,7 +224,8 @@ type Conn struct {
 	// Fields that must be accessed via atomic load/stores.
 
 	// noV4 and noV6 are whether IPv4 and IPv6 are known to be
-	// missing.  They're only used to suppress log spam. The name
+	// missing. They're used to suppress log spam and as best-effort hints
+	// for WireGuard-only endpoint discovery and first-send selection. The name
 	// is named negatively because in early start-up, we don't yet
 	// necessarily have a netcheck.Report and don't want to skip
 	// logging.

@@ -635,7 +635,11 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
 func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
 	udpAddr = de.bestAddr.epAddr
 
-	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
+	// A pre-send lookup must not pin a speculative WireGuard-only choice
+	// before netcheck has supplied the first send's family hints. Preserve
+	// confirmed paths, including addresses learned from incoming traffic.
+	speculativeWGChoice := de.isWireguardOnly && de.lastSendAny.IsZero() && de.bestAddrAt.IsZero()
+	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) && !speculativeWGChoice {
 		return udpAddr, netip.AddrPort{}, false
 	}
 
@@ -656,7 +660,8 @@ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr n
 // the endpoint, then a randomly selected address for the endpoint is returned,
 // as well as a bool indicating that WireGuard discovery pings should be started.
 // If the addresses have latency information available, then the address with the
-// best latency is used.
+// best latency is used. On the first send without latency information, prefer
+// an address family that netcheck has not reported missing, if one is available.
 //
 // de.mu must be held.
 func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, shouldPing bool) {
@@ -691,11 +696,31 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, s
 
 	if !udpAddr.ap.IsValid() {
 		candidates := slicesx.MapKeys(de.endpointState)
+		if de.lastSendAny.IsZero() {
+			// Family hints can be wrong. Only prefer them for the first send,
+			// and never discard every candidate or exclude a family permanently.
+			noV4, noV6 := de.c.noV4.Load(), de.c.noV6.Load()
+			var preferred []netip.AddrPort
+			for _, addr := range candidates {
+				if addr.Addr().Is4() && !noV4 || addr.Addr().Is6() && !noV6 {
+					preferred = append(preferred, addr)
+				}
+			}
+			if len(preferred) > 0 {
+				candidates = preferred
+			}
+		}
 
 		// Randomly select an address to use until we retrieve latency information
 		// and give it a short trustBestAddrUntil time so we avoid flapping between
 		// addresses while waiting on latency information to be populated.
-		udpAddr.ap = candidates[rand.IntN(len(candidates))]
+		if pick := de.c.testOnlyPickWireGuardEndpoint; pick != nil {
+			udpAddr.ap = pick(candidates)
+		} else {
+			udpAddr.ap = candidates[rand.IntN(len(candidates))]
+		}
+		// A random choice does not inherit confirmation of an earlier path.
+		de.bestAddrAt = 0
 	}
 
 	de.bestAddr.epAddr = epAddr{ap: udpAddr.ap}
@@ -1127,7 +1152,10 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		}
 	}
 	de.noteTxActivityExtTriggerLocked(now)
-	de.lastSendAny = now
+	// Without a destination, a WireGuard-only peer has not used its first send.
+	if !de.isWireguardOnly || udpAddr.ap.IsValid() {
+		de.lastSendAny = now
+	}
 	de.mu.Unlock()
 
 	if !udpAddr.ap.IsValid() && !derpAddr.IsValid() {
