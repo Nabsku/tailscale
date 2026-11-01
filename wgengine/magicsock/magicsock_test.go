@@ -3543,9 +3543,12 @@ func TestWireGuardOnlyFirstSendAddressFamily(t *testing.T) {
 	}
 	v4 := netip.MustParseAddrPort("192.0.2.1:51820")
 	v6 := netip.MustParseAddrPort("[2001:db8::1]:51820")
+	local4 := []net.Addr{&net.IPAddr{IP: net.IPv4(192, 0, 2, 2).To4()}}
+	local6 := []net.Addr{&net.IPAddr{IP: net.ParseIP("2001:db8::2")}}
 	for _, tt := range []struct {
 		name         string
 		endpoints    []netip.AddrPort
+		localAddrs   []net.Addr // nil means no interface snapshot
 		noV4, noV6   bool
 		pickV4       bool
 		unreachable  bool
@@ -3571,10 +3574,34 @@ func TestWireGuardOnlyFirstSendAddressFamily(t *testing.T) {
 		{name: "reply-to-inbound-source-without-endpoints", noV4: true, recvFirst: true, want: v4},
 		{name: "reply-to-inbound-source-with-stale-endpoint", endpoints: []netip.AddrPort{v6}, noV4: true, recvFirst: true, want: v4},
 		{name: "hints-after-expired-receive-and-ping", endpoints: []netip.AddrPort{v4, v6}, noV6: true, unreachable: true, recvFirst: true, expireRecv: true, pingFirst: true, want: v4},
+		{name: "ipv4-local-blocked-netcheck", endpoints: []netip.AddrPort{v4, v6}, localAddrs: local4, noV4: true, noV6: true, unreachable: true, want: v4},
+		{name: "ipv6-local-blocked-netcheck", endpoints: []netip.AddrPort{v4, v6}, localAddrs: local6, noV4: true, noV6: true, pickV4: true, unreachable: true, want: v6},
+		{name: "ipv4-local-before-netcheck", endpoints: []netip.AddrPort{v4, v6}, localAddrs: local4, unreachable: true, want: v4},
+		{name: "ipv6-local-before-netcheck", endpoints: []netip.AddrPort{v4, v6}, localAddrs: local6, pickV4: true, unreachable: true, want: v6},
+		{name: "ipv4-local-stale-netcheck", endpoints: []netip.AddrPort{v4, v6}, localAddrs: local4, noV4: true, unreachable: true, want: v4},
+		{name: "dual-local-blocked-netcheck", endpoints: []netip.AddrPort{v4, v6}, localAddrs: append(slices.Clone(local4), local6...), noV4: true, noV6: true, want: v6},
+		{name: "empty-local-snapshot", endpoints: []netip.AddrPort{v4, v6}, localAddrs: []net.Addr{}, noV6: true, unreachable: true, want: v4},
+		{name: "ipv6-only-peer-despite-local-ipv4", endpoints: []netip.AddrPort{v6}, localAddrs: local4, want: v6},
+		{name: "later-send-despite-local-ipv4", endpoints: []netip.AddrPort{v4, v6}, localAddrs: local4, sentBefore: true, want: v6},
+		{name: "measured-latency-despite-local-ipv4", endpoints: []netip.AddrPort{v4, v6}, localAddrs: local4, knownLatency: true, want: v6},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			var mon *netmon.Monitor
+			if tt.localAddrs != nil {
+				tstest.AssertNotParallel(t)
+				func() {
+					netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) {
+						return []netmon.Interface{{
+							Interface: &net.Interface{Name: "cold-test0", Flags: net.FlagUp},
+							AltAddrs:  tt.localAddrs,
+						}}, nil
+					})
+					defer netmon.RegisterInterfaceGetter(nil)
+					mon = netmon.NewStatic()
+				}()
+			}
 			synctest.Test(t, func(t *testing.T) {
-				c := &Conn{logf: t.Logf, metrics: new(metrics)}
+				c := &Conn{logf: t.Logf, metrics: new(metrics), netMon: mon}
 				c.noV4.Store(tt.noV4)
 				c.noV6.Store(tt.noV6)
 				c.testOnlyPickWireGuardEndpoint = func(candidates []netip.AddrPort) netip.AddrPort {
@@ -3587,7 +3614,7 @@ func TestWireGuardOnlyFirstSendAddressFamily(t *testing.T) {
 				}
 				pc4, pc6 := new(wireGuardSendPacketConn), new(wireGuardSendPacketConn)
 				if tt.unreachable {
-					if tt.noV4 {
+					if tt.want.Addr().Is6() {
 						pc4.writeErr = syscall.ENETUNREACH
 					} else {
 						pc6.writeErr = syscall.ENETUNREACH

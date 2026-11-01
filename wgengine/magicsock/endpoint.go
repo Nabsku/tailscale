@@ -661,7 +661,8 @@ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr n
 // as well as a bool indicating that WireGuard discovery pings should be started.
 // If the addresses have latency information available, then the address with the
 // best latency is used. On the first send without latency information, prefer
-// an address family that netcheck has not reported missing, if one is available.
+// the locally available family on single-stack networks, or otherwise a family
+// that netcheck has not reported missing, if one is available.
 //
 // de.mu must be held.
 func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, shouldPing bool) {
@@ -700,6 +701,13 @@ func (de *endpoint) addrForWireGuardSendLocked(now mono.Time) (udpAddr epAddr, s
 			// Family hints can be wrong. Only prefer them for the first send,
 			// and never discard every candidate or exclude a family permanently.
 			noV4, noV6 := de.c.noV4.Load(), de.c.noV6.Load()
+			// Restricted egress can make netcheck report both families missing.
+			// A single-stack interface snapshot is useful even before netcheck.
+			if de.c.netMon != nil {
+				if st := de.c.netMon.InterfaceState(); st != nil && st.HaveV4 != st.HaveV6 {
+					noV4, noV6 = !st.HaveV4, !st.HaveV6
+				}
+			}
 			var preferred []netip.AddrPort
 			for _, addr := range candidates {
 				if addr.Addr().Is4() && !noV4 || addr.Addr().Is6() && !noV6 {
