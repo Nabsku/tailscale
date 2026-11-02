@@ -133,7 +133,8 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
-	if ep.lastSendExt == 0 && lastRecv == 0 {
+	lastRecvUDP := ep.lastRecvUDPAny.LoadAtomic()
+	if ep.lastSendExt == 0 && lastRecv == 0 && lastRecvUDP == 0 {
 		return // no activity ever
 	}
 
@@ -147,6 +148,7 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 	}
 
 	fmt.Fprintf(w, "<p>Best: <b>%+v</b>, %v ago (for %v)</p>\n", ep.bestAddr, fmtMono(ep.bestAddrAt), ep.trustBestAddrUntil.Sub(mnow).Round(time.Millisecond))
+	fmt.Fprintf(w, "<p>lastRecvUDP: %v ago</p>\n", fmtMono(lastRecvUDP))
 	fmt.Fprintf(w, "<p>heartbeating: %v</p>\n", ep.heartBeatTimer != nil)
 	fmt.Fprintf(w, "<p>lastSend: %v ago</p>\n", fmtMono(ep.lastSendExt))
 	fmt.Fprintf(w, "<p>lastFullPing: %v ago</p>\n", fmtMono(ep.lastFullPing))
