@@ -1,0 +1,48 @@
+# Channel contract and approval procedure: docs/mullvad-image-channel.md
+name: Promote Mullvad image channel
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: After separate publication approval, enter publish-mullvad
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: mullvad-channel-publish
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'Nabsku/tailscale' &&
+      github.ref == 'refs/heads/main' &&
+      vars.MULLVAD_CHANNEL_PUBLISH_ENABLED == 'true' &&
+      inputs.confirmation == 'publish-mullvad'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    env:
+      # Fixed, reviewed artifact; never build the unpatched default branch.
+      SOURCE: ghcr.io/nabsku/tailscale@sha256:f1594058f5a1c3b61bd9da683925676a200f785951f4d5eaa9859d27afcb8dc3
+      CHANNEL: ghcr.io/nabsku/tailscale:mullvad
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote the reviewed manifest and verify its digest
+        shell: bash
+        run: |
+          docker buildx imagetools create --prefer-index=false --tag "$CHANNEL" "$SOURCE"
+          actual="$(docker buildx imagetools inspect --raw "$CHANNEL" | sha256sum)"
+          if [[ "${actual%% *}" != "${SOURCE##*@sha256:}" ]]; then
+            echo "::error::Mullvad channel digest does not match the reviewed source"
+            exit 1
+          fi
